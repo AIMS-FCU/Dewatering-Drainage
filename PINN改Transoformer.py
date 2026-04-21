@@ -50,8 +50,8 @@ config = {
     "R_init": 100.0,         
     "C_init": 0.01,           
     "rw": 0.45,               
-    "epochs": 300,            # 正式訓練
-    "batch_size": 256,        # 原為 512，因為 window_size 放大到 120 導致 OOM 記憶體爆掉，調降來解決
+    "epochs": 1000,            # 正式訓練
+    "batch_size": 1024,        # 原為 512，因為 window_size 放大到 120 導致 OOM 記憶體爆掉，調降來解決
     "lambda_phys_final": 2.0, 
     "lambda_flow": 2.0,       
     "warmup_epochs": 150,      
@@ -209,409 +209,558 @@ class PINN_Feedback_Model(Model):
 # 3. 數據處理與執行
 # ==========================================
 if __name__ == "__main__":
-    save_p = config["save_folder"]
-    if not os.path.exists(save_p): os.makedirs(save_p)
 
-    print("📊 數據處理中...")
-    df_raw = pd.read_csv('Master_Training_Data_Continuous3.csv', index_col=0)
-    df_raw.index = pd.to_datetime(df_raw.index)
-    dist_df = pd.read_csv('Distance_Matrix.csv', index_col=0)
+    base_config = config.copy()
+    tasks = [
+        {
+            "save_folder": "PINN_MAPE_Complete_Report3_Run1",
+            "PREDICT_START": "2021-05-01 00:00",
+            "PREDICT_END":   "2021-06-01 00:00",
+            "TEST_START":    "2021-05-01 00:00",
+            "TEST_END":      "2021-06-01 00:00",
+        },
+        {
+            "save_folder": "PINN_MAPE_Complete_Report3_Run2",
+            "PREDICT_START": "2020-10-01 00:00",
+            "PREDICT_END":   "2020-11-01 00:00",
+            "TEST_START":    "2020-10-01 00:00",
+            "TEST_END":      "2020-11-01 00:00",
+        },
+        {
+            "save_folder": "PINN_MAPE_Complete_Report3_Run3",
+            "PREDICT_START": "2020-12-01 00:00",
+            "PREDICT_END":   "2020-12-31 00:00",
+            "TEST_START":    "2020-12-01 00:00",
+            "TEST_END":      "2020-12-31 00:00",
+        }
+    ]
 
-    # [數據切斷]：根據使用者需求，只訓練到 2021 年 6 月底
-    if config.get("TRAIN_CUTOFF"):
-        cutoff_date = pd.to_datetime(config["TRAIN_CUTOFF"])
-        df_raw = df_raw.loc[df_raw.index < cutoff_date]
-        print(f"✂️ 數據已根據 TRAIN_CUTOFF 切斷，目前數據上限為: {df_raw.index.max()}")
+    for task_idx, task_params in enumerate(tasks):
+        print(f"\n\n{'='*60}\n🚀 啟動獨立任務 {task_idx+1}/3: 儲存至 {task_params['save_folder']}\n{'='*60}\n")
+        config = base_config.copy()
+        config.update(task_params)
+        tf.keras.backend.clear_session()
+        save_p = config["save_folder"]
+        if not os.path.exists(save_p): os.makedirs(save_p)
 
-    df_master = df_raw.copy().ffill().bfill()
-    print(f"📊 訓練資料（完整資料集）：{df_master.index.min()} → {df_master.index.max()}")
+        print("📊 數據處理中...")
+        df_raw = pd.read_csv('Master_Training_Data_Continuous3.csv', index_col=0)
+        df_raw.index = pd.to_datetime(df_raw.index)
+        dist_df = pd.read_csv('Distance_Matrix.csv', index_col=0)
 
-    obs_cols = [c for c in ['PA', 'PB', 'PC', 'FPS7', 'FPS8', 'FPS9', 'FPS2', 'FPS3', 'FPS4', 'FPS5', 'FPS6'] if c in df_raw.columns]
-    wells_list = [w for w in ["PW01", "PW02", "PW03", "PW04", "PW06", "PW07", "PW08", "PW09", "PW010", "PW011", "PW012", "PW013"] if w in df_raw.columns and df_raw[w].abs().max() > 1e-6]
-    flow_cols = [f"Qw{map_sensor_id(w)}" for w in wells_list]
+        # [數據切斷]：根據使用者需求，只訓練到 2021 年 6 月底
+        if config.get("TRAIN_CUTOFF"):
+            cutoff_date = pd.to_datetime(config["TRAIN_CUTOFF"])
+            df_raw = df_raw.loc[df_raw.index < cutoff_date]
+            print(f"✂️ 數據已根據 TRAIN_CUTOFF 切斷，目前數據上限為: {df_raw.index.max()}")
+
+        df_master = df_raw.copy().ffill().bfill()
+        print(f"📊 訓練資料（完整資料集）：{df_master.index.min()} → {df_master.index.max()}")
+
+        obs_cols = [c for c in ['PA', 'PB', 'PC', 'FPS7', 'FPS8', 'FPS9', 'FPS2', 'FPS3', 'FPS4', 'FPS5', 'FPS6'] if c in df_raw.columns]
+        wells_list = [w for w in ["PW01", "PW02", "PW03", "PW04", "PW06", "PW07", "PW08", "PW09", "PW010", "PW011", "PW012", "PW013"] if w in df_raw.columns and df_raw[w].abs().max() > 1e-6]
+        flow_cols = [f"Qw{map_sensor_id(w)}" for w in wells_list]
     
-    idx_map = {"n_obs": len(obs_cols), "n_wells": len(wells_list), "h_end": len(obs_cols)+len(wells_list), "flow_start": len(df_master.columns) - len(flow_cols)}
-    h_min, h_max = df_master.iloc[:, :idx_map["h_end"]].min().values, df_master.iloc[:, :idx_map["h_end"]].max().values + 1e-7
-    q_min, q_max = df_master[flow_cols].min().values, df_master[flow_cols].max().values + 1e-7
-    scaler = MinMaxScaler().fit(df_master)
+        idx_map = {"n_obs": len(obs_cols), "n_wells": len(wells_list), "h_end": len(obs_cols)+len(wells_list), "flow_start": len(df_master.columns) - len(flow_cols)}
+        h_min, h_max = df_master.iloc[:, :idx_map["h_end"]].min().values, df_master.iloc[:, :idx_map["h_end"]].max().values + 1e-7
+        q_min, q_max = df_master[flow_cols].min().values, df_master[flow_cols].max().values + 1e-7
+        scaler = MinMaxScaler().fit(df_master)
 
-    def create_seq(df):
-        data_s = scaler.transform(df)
-        X, y = [], []
-        for i in range(len(data_s) - config["window_size"]):
-            X.append(data_s[i:i+config["window_size"]])
-            y.append(np.concatenate([data_s[i+config["window_size"], :idx_map["h_end"]], data_s[i+config["window_size"], idx_map["flow_start"]:]]))
-        return np.array(X), np.array(y)
+        def create_seq(df):
+            data_s = scaler.transform(df)
+            X, y = [], []
+            for i in range(len(data_s) - config["window_size"]):
+                X.append(data_s[i:i+config["window_size"]])
+                y.append(np.concatenate([data_s[i+config["window_size"], :idx_map["h_end"]], data_s[i+config["window_size"], idx_map["flow_start"]:]]))
+            return np.array(X), np.array(y)
 
-    # ==========================================
-    # 🌟 3.4 [資料切分] 建立 Hold-out 盲測考卷
-    # ==========================================
-    test_start = pd.to_datetime(config["TEST_START"])
-    test_end = pd.to_datetime(config["TEST_END"])
+        # ==========================================
+        # 🌟 3.4 [資料切分] 建立 Hold-out 盲測考卷
+        # ==========================================
+        test_start = pd.to_datetime(config["TEST_START"])
+        test_end = pd.to_datetime(config["TEST_END"])
     
-    # 切成三段，避免時序接軌產生跳躍
-    df_train_part1 = df_master.loc[df_master.index < test_start]
-    df_test        = df_master.loc[(df_master.index >= test_start) & (df_master.index < test_end)]
-    df_train_part2 = df_master.loc[df_master.index >= test_end]
+        # 切成三段，避免時序接軌產生跳躍
+        df_train_part1 = df_master.loc[df_master.index < test_start]
+        df_test        = df_master.loc[(df_master.index >= test_start) & (df_master.index < test_end)]
+        df_train_part2 = df_master.loc[df_master.index >= test_end]
 
-    print(f"\n✂️ 資料切分完畢：")
-    print(f"  - 訓練集 Part1 : {df_train_part1.index.min()} → {df_train_part1.index.max()} (共 {len(df_train_part1)} 筆)")
-    print(f"  - 訓練集 Part2 : {df_train_part2.index.min()} → {df_train_part2.index.max()} (共 {len(df_train_part2)} 筆)")
-    print(f"  - 盲測集 (Test): {df_test.index.min()} → {df_test.index.max()} (共 {len(df_test)} 筆)")
+        print(f"\n✂️ 資料切分完畢：")
+        print(f"  - 訓練集 Part1 : {df_train_part1.index.min()} → {df_train_part1.index.max()} (共 {len(df_train_part1)} 筆)")
+        print(f"  - 訓練集 Part2 : {df_train_part2.index.min()} → {df_train_part2.index.max()} (共 {len(df_train_part2)} 筆)")
+        print(f"  - 盲測集 (Test): {df_test.index.min()} → {df_test.index.max()} (共 {len(df_test)} 筆)")
 
-    # 分別做成序列
-    X_tr1, y_tr1 = create_seq(df_train_part1) if len(df_train_part1) > config["window_size"] else ([], [])
-    X_tr2, y_tr2 = create_seq(df_train_part2) if len(df_train_part2) > config["window_size"] else ([], [])
-    X_test, y_test = create_seq(df_test)
+        # 分別做成序列
+        X_tr1, y_tr1 = create_seq(df_train_part1) if len(df_train_part1) > config["window_size"] else ([], [])
+        X_tr2, y_tr2 = create_seq(df_train_part2) if len(df_train_part2) > config["window_size"] else ([], [])
+        X_test, y_test = create_seq(df_test)
 
-    # 合併訓練集
-    if len(X_tr1) > 0 and len(X_tr2) > 0:
-        X_train_full = np.concatenate([X_tr1, X_tr2])
-        y_train_full = np.concatenate([y_tr1, y_tr2])
-    elif len(X_tr1) > 0:
-        X_train_full, y_train_full = X_tr1, y_tr1
-    else:
-        X_train_full, y_train_full = X_tr2, y_tr2
+        # 合併訓練集
+        if len(X_tr1) > 0 and len(X_tr2) > 0:
+            X_train_full = np.concatenate([X_tr1, X_tr2])
+            y_train_full = np.concatenate([y_tr1, y_tr2])
+        elif len(X_tr1) > 0:
+            X_train_full, y_train_full = X_tr1, y_tr1
+        else:
+            X_train_full, y_train_full = X_tr2, y_tr2
 
-    # ==========================================
-    # 🌟 3.5 5-Fold Cross Validation (可開關)
-    # ==========================================
-    if config.get("USE_KFOLD", False):
-        from sklearn.model_selection import KFold
-        kf = KFold(n_splits=5, shuffle=False)
+        # ==========================================
+        # 🌟 3.5 5-Fold Cross Validation (可開關)
+        # ==========================================
+        if config.get("USE_KFOLD", False):
+            from sklearn.model_selection import KFold
+            kf = KFold(n_splits=5, shuffle=False)
         
-        cv_epochs = 300
-        print(f"\n🔄 啟動 5-Fold Cross Validation (針對訓練集，每折 {cv_epochs} epochs)...")
-        fold = 1
-        cv_scores = []
+            cv_epochs = 300
+            print(f"\n🔄 啟動 5-Fold Cross Validation (針對訓練集，每折 {cv_epochs} epochs)...")
+            fold = 1
+            cv_scores = []
         
-        for train_idx, val_idx in kf.split(X_train_full):
-            print(f"\n--- Fold {fold}/5 ---")
-            X_tr, y_tr = X_train_full[train_idx], y_train_full[train_idx]
-            X_val, y_val = X_train_full[val_idx], y_train_full[val_idx]
+            for train_idx, val_idx in kf.split(X_train_full):
+                print(f"\n--- Fold {fold}/5 ---")
+                X_tr, y_tr = X_train_full[train_idx], y_train_full[train_idx]
+                X_val, y_val = X_train_full[val_idx], y_train_full[val_idx]
             
-            cv_model = PINN_Feedback_Model(dist_df.loc[obs_cols+wells_list, wells_list].values, config, idx_map, h_min, h_max, q_min, q_max, len(X_tr))
-            cv_model.compile(); cv_model.build(input_shape=X_tr.shape)
+                cv_model = PINN_Feedback_Model(dist_df.loc[obs_cols+wells_list, wells_list].values, config, idx_map, h_min, h_max, q_min, q_max, len(X_tr))
+                cv_model.compile(); cv_model.build(input_shape=X_tr.shape)
             
-            print("  正在訓練...", flush=True)
-            cv_model.fit(X_tr, y_tr, epochs=cv_epochs, batch_size=config["batch_size"], verbose=1)
+                print("  正在訓練...", flush=True)
+                cv_model.fit(X_tr, y_tr, epochs=cv_epochs, batch_size=config["batch_size"], verbose=1)
             
-            hp_val_s, _, _ = cv_model.predict(X_val, verbose=0)
-            hp_val = hp_val_s * (h_max - h_min) + h_min
-            y_val_h = y_val[:, :idx_map["h_end"]] * (h_max - h_min) + h_min
+                hp_val_s, _, _ = cv_model.predict(X_val, verbose=0)
+                hp_val = hp_val_s * (h_max - h_min) + h_min
+                y_val_h = y_val[:, :idx_map["h_end"]] * (h_max - h_min) + h_min
             
-            wape_score = calculate_wape(y_val_h, hp_val)
-            print(f"完成！ Validation WAPE 誤差: {wape_score:.2f}%")
-            cv_scores.append(wape_score)
-            fold += 1
+                wape_score = calculate_wape(y_val_h, hp_val)
+                print(f"完成！ Validation WAPE 誤差: {wape_score:.2f}%")
+                cv_scores.append(wape_score)
+                fold += 1
             
-        print(f"\n📊 5-Fold CV 原本的訓練體驗證平均 WAPE: {np.mean(cv_scores):.2f}%")
-    else:
-        print(f"\n⏭️ 根據設定，已跳過 5-Fold Cross Validation 流程。")
+            print(f"\n📊 5-Fold CV 原本的訓練體驗證平均 WAPE: {np.mean(cv_scores):.2f}%")
+        else:
+            print(f"\n⏭️ 根據設定，已跳過 5-Fold Cross Validation 流程。")
 
-    # ==========================================
-    # 🌟 3.6 最終全訓練集正式訓練
-    # ==========================================
-    print(f"\n🚀 啟動最終訓練集正式訓練 (Epochs: {config['epochs']}) 產出實體參數...")
-    model = PINN_Feedback_Model(dist_df.loc[obs_cols+wells_list, wells_list].values, config, idx_map, h_min, h_max, q_min, q_max, len(X_train_full))
-    model.compile(); model.build(input_shape=X_train_full.shape)
+        # ==========================================
+        # 🌟 3.6 最終全訓練集正式訓練
+        # ==========================================
+        print(f"\n🚀 啟動最終訓練集正式訓練 (Epochs: {config['epochs']}) 產出實體參數...")
+        model = PINN_Feedback_Model(dist_df.loc[obs_cols+wells_list, wells_list].values, config, idx_map, h_min, h_max, q_min, q_max, len(X_train_full))
+        model.compile(); model.build(input_shape=X_train_full.shape)
 
-    history = model.fit(X_train_full, y_train_full, epochs=config["epochs"], batch_size=config["batch_size"], verbose=1)
+        history = model.fit(X_train_full, y_train_full, epochs=config["epochs"], batch_size=config["batch_size"], verbose=1)
 
-    # ==========================================
-    # 🌟 3.7 [盲測驗證] 最終模型成績發表
-    # ==========================================
-    print(f"\n🏆 正在對 {config['TEST_START']} 至 {config['TEST_END']} 進行盲測評分...")
-    hp_test_s, _, _ = model.predict(X_test, verbose=0)
-    hp_test = hp_test_s * (h_max - h_min) + h_min
-    y_test_h = y_test[:, :idx_map["h_end"]] * (h_max - h_min) + h_min
+        # ==========================================
+        # 🌟 3.7 [盲測驗證] 最終模型成績發表
+        # ==========================================
+        print(f"\n🏆 正在對 {config['TEST_START']} 至 {config['TEST_END']} 進行盲測評分...")
+        hp_test_s, qp_test_s, _ = model.predict(X_test, verbose=0)
+        hp_test = hp_test_s * (h_max - h_min) + h_min
+        qp_test = qp_test_s * (q_max - q_min) + q_min
+        y_test_h = y_test[:, :idx_map["h_end"]] * (h_max - h_min) + h_min
+        qt_test = y_test[:, idx_map["h_end"]:] * (q_max - q_min) + q_min
     
-    test_wape = calculate_wape(y_test_h, hp_test)
-    test_mae = mean_absolute_error(y_test_h, hp_test)
-    print(f"==========================================")
-    print(f"🏅 [盲測成績] 10月份整體預測準確率 (WAPE) : {test_wape:.2f}%")
-    print(f"🏅 [盲測成績] 10月份整體預測平均誤差 (MAE) : {test_mae:.3f} m")
-    print(f"==========================================\n")
+        test_wape = calculate_wape(y_test_h, hp_test)
+        test_mae = mean_absolute_error(y_test_h, hp_test)
+        print(f"==========================================")
+        print(f"🏅 [盲測成績] 10月份整體預測準確率 (WAPE) : {test_wape:.2f}%")
+        print(f"🏅 [盲測成績] 10月份整體預測平均誤差 (MAE) : {test_mae:.3f} m")
+        print(f"==========================================\n")
 
-    # ==========================================
-    # 🌟 4. [物理提取] 包含 Qin 與 Sy 學習 (仍使用訓練集提取物理參數)
-    # ==========================================
-    print("\n🧹 正在進行物理診斷提取...")
-    learned_sy = float(tf.sigmoid(model.Sy_logit).numpy()[0])
-    hp_train_s, qp_train_s, _ = model.predict(X_train_full)
-    hp_train = hp_train_s * (h_max - h_min) + h_min
-    qp_train = qp_train_s * (q_max - q_min) + q_min
-    ht_train = y_train_full[:, :idx_map["h_end"]] * (h_max - h_min) + h_min
-    qt_train = y_train_full[:, idx_map["h_end"]:] * (q_max - q_min) + q_min
+        print("📊 正在生成 Full_Diagnostic_Report_Test.csv (TEST 區間診斷)...")
+        test_diag_data = []
+        test_point_names = obs_cols + wells_list
+        for i, name in enumerate(test_point_names):
+            h_mae = mean_absolute_error(y_test_h[:, i], hp_test[:, i])
+            h_mape = calculate_wape(y_test_h[:, i], hp_test[:, i])
 
-    avg_h_pinn = np.mean(hp_train[:, :idx_map["n_obs"]], axis=1)
-    dH_dt_pinn = np.zeros_like(avg_h_pinn)
-    dH_dt_pinn[1:-1] = (avg_h_pinn[2:] - avg_h_pinn[:-2]) / (2.0 * config["DELTA_T"])
-    total_Q_train = np.sum(qt_train, axis=1)
+            q_mae, q_mape = np.nan, np.nan
+            if name in wells_list:
+                w_idx = wells_list.index(name)
+                q_mae = mean_absolute_error(qt_test[:, w_idx], qp_test[:, w_idx])
+                q_mape = calculate_wape(qt_test[:, w_idx], qp_test[:, w_idx])
 
-    valid_idx = slice(1, -1)
-    X_reg = (config["area_A"] * dH_dt_pinn[valid_idx]).reshape(-1, 1)
-    Y_reg = total_Q_train[valid_idx].reshape(-1, 1)
-    qin_series = total_Q_train[valid_idx] + (config["area_A"] * learned_sy * dH_dt_pinn[valid_idx])
-    qin_smooth = np.convolve(qin_series, np.ones(24)/24, mode='same')
-    inflow_pinn_mean = float(np.mean(qin_smooth))
+            test_diag_data.append({
+                "Well": name,
+                "Type": "Pump" if name in wells_list else "Obs",
+                "MAE_Level(m)": h_mae,
+                "MAPE_Level(%)": h_mape,
+                "MAE_Flow(m3/hr)": q_mae,
+                "MAPE_Flow(%)": q_mape,
+            })
 
-    r2_pinn_val = r2_score(total_Q_train[valid_idx], inflow_pinn_mean - (config["area_A"] * learned_sy * dH_dt_pinn[valid_idx]))
+        df_diag_test = pd.DataFrame(test_diag_data)
+        df_diag_test.to_csv(f"{save_p}/Full_Diagnostic_Report_Test.csv", index=False, encoding='utf-8-sig')
 
-    # --- 儲存參數 ---
-    np.save(f"{save_p}/learned_T.npy", np.mean(tf.exp(model.T_log).numpy()))
-    np.save(f"{save_p}/learned_C.npy", tf.exp(model.C_log).numpy())
-    np.save(f"{save_p}/qin_series.npy", qin_series)
-    np.save(f"{save_p}/qin_smooth.npy", qin_smooth)
-    np.save(f"{save_p}/calibrated_inflow_sy.npy", np.array([inflow_pinn_mean, learned_sy]))
+        # ==========================================
+        # 🌟 4. [物理提取] 包含 Qin 與 Sy 學習 (仍使用訓練集提取物理參數)
+        # ==========================================
+        print("\n🧹 正在進行物理診斷提取...")
+        learned_sy = float(tf.sigmoid(model.Sy_logit).numpy()[0])
+        hp_train_s, qp_train_s, _ = model.predict(X_train_full)
+        hp_train = hp_train_s * (h_max - h_min) + h_min
+        qp_train = qp_train_s * (q_max - q_min) + q_min
+        ht_train = y_train_full[:, :idx_map["h_end"]] * (h_max - h_min) + h_min
+        qt_train = y_train_full[:, idx_map["h_end"]:] * (q_max - q_min) + q_min
 
-    # --- 自回歸預測（不看答案）---
-    predict_start = pd.to_datetime(config["PREDICT_START"])
-    predict_end = pd.to_datetime(config["PREDICT_END"])
-    predict_steps = int((predict_end - predict_start).total_seconds() / (config["DELTA_T"] * 3600))
-    print(f"\n🔮 自回歸預測：{config['PREDICT_START']} → {config['PREDICT_END']}（共 {predict_steps} 步，不看答案）...")
+        avg_h_pinn = np.mean(hp_train[:, :idx_map["n_obs"]], axis=1)
+        dH_dt_pinn = np.zeros_like(avg_h_pinn)
+        dH_dt_pinn[1:-1] = (avg_h_pinn[2:] - avg_h_pinn[:-2]) / (2.0 * config["DELTA_T"])
+        total_Q_train = np.sum(qt_train, axis=1)
 
-    # 取 PREDICT_START 前的 window_size 筆作為初始上下文
-    context_data = df_master.loc[df_master.index < predict_start].tail(config["window_size"])
-    assert len(context_data) >= config["window_size"], \
-        f"❌ 上下文不足：PREDICT_START 前需要至少 {config['window_size']} 筆資料，僅有 {len(context_data)} 筆"
+        valid_idx = slice(1, -1)
+        X_reg = (config["area_A"] * dH_dt_pinn[valid_idx]).reshape(-1, 1)
+        Y_reg = total_Q_train[valid_idx].reshape(-1, 1)
+        qin_series = total_Q_train[valid_idx] + (config["area_A"] * learned_sy * dH_dt_pinn[valid_idx])
+        qin_smooth = np.convolve(qin_series, np.ones(24)/24, mode='same')
+        inflow_pinn_mean = float(np.mean(qin_smooth))
 
-    curr_win = scaler.transform(context_data).reshape(1, config["window_size"], -1)
+        r2_pinn_val = r2_score(total_Q_train[valid_idx], inflow_pinn_mean - (config["area_A"] * learned_sy * dH_dt_pinn[valid_idx]))
 
-    # ✅ 初始條件錨定：將 context window 最後一步的水位欄位替換為 PREDICT_START 的真實觀測值
-    # 這確保自回歸預測從「真實已知的初始水位」出發，而不是讓模型猜起始點
-    actual_start_row = df_master.loc[df_master.index <= predict_start].iloc[-1]
-    actual_start_h_raw = actual_start_row[obs_cols].values.astype(float)
-    # 用與訓練相同的 scaler 將真實水位歸一化後寫入 context window 最後一步
-    full_start_row = actual_start_row.values.astype(float).reshape(1, -1)
-    full_start_scaled = scaler.transform(full_start_row)[0]
-    curr_win[0, -1, :idx_map["n_obs"]] = full_start_scaled[:idx_map["n_obs"]]
-    print(f"  📍 初始條件錨定完成：PREDICT_START 實際水位 = {np.round(actual_start_h_raw, 2)}")
+        # --- 儲存參數 ---
+        np.save(f"{save_p}/learned_T.npy", np.mean(tf.exp(model.T_log).numpy()))
+        np.save(f"{save_p}/learned_C.npy", tf.exp(model.C_log).numpy())
+        np.save(f"{save_p}/qin_series.npy", qin_series)
+        np.save(f"{save_p}/qin_smooth.npy", qin_smooth)
+        np.save(f"{save_p}/calibrated_inflow_sy.npy", np.array([inflow_pinn_mean, learned_sy]))
 
-    future_h, future_qin = [], []
-    for _ in range(predict_steps):
-        hp_s, _, qip_s = model(curr_win, training=False)
-        future_h.append(hp_s.numpy()[0, :idx_map["n_obs"]] * (h_max[:idx_map["n_obs"]] - h_min[:idx_map["n_obs"]]) + h_min[:idx_map["n_obs"]])
-        future_qin.append(qip_s.numpy()[0, 0] * 500.0)
+        # --- 自回歸預測（不看答案）---
+        predict_start = pd.to_datetime(config["PREDICT_START"])
+        predict_end = pd.to_datetime(config["PREDICT_END"])
+        predict_steps = int((predict_end - predict_start).total_seconds() / (config["DELTA_T"] * 3600))
+        print(f"\n🔮 自回歸預測：{config['PREDICT_START']} → {config['PREDICT_END']}（共 {predict_steps} 步，不看答案）...")
+
+        # 取 PREDICT_START 前的 window_size 筆作為初始上下文
+        context_data = df_master.loc[df_master.index < predict_start].tail(config["window_size"])
+        assert len(context_data) >= config["window_size"], \
+            f"❌ 上下文不足：PREDICT_START 前需要至少 {config['window_size']} 筆資料，僅有 {len(context_data)} 筆"
+
+        curr_win = scaler.transform(context_data).reshape(1, config["window_size"], -1)
+
+        # ✅ 初始條件錨定：將 context window 最後一步的水位欄位替換為 PREDICT_START 的真實觀測值
+        # 這確保自回歸預測從「真實已知的初始水位」出發，而不是讓模型猜起始點
+        actual_start_row = df_master.loc[df_master.index <= predict_start].iloc[-1]
+        actual_start_h_raw = actual_start_row[obs_cols].values.astype(float)
+        # 用與訓練相同的 scaler 將真實水位歸一化後寫入 context window 最後一步
+        full_start_row = actual_start_row.values.astype(float).reshape(1, -1)
+        full_start_scaled = scaler.transform(full_start_row)[0]
+        curr_win[0, -1, :idx_map["n_obs"]] = full_start_scaled[:idx_map["n_obs"]]
+        print(f"  📍 初始條件錨定完成：PREDICT_START 實際水位 = {np.round(actual_start_h_raw, 2)}")
+
+        future_feedback_df = df_master.loc[(df_master.index > predict_start) & (df_master.index <= predict_end)].copy()
+    
+        # 取消 1/3 真實值輸入，強制作為 0，進行全程盲測
+        teacher_forcing_steps = 0
+        print(f"  ?? 全程盲測：完全不使用真值回填，全程使用預測值 (Autoregressive)")
+
+        future_h, future_qin = [], []
+        for step in range(predict_steps):
+            hp_s, qp_s, qip_s = model(curr_win, training=False)
+
+            hp_pred = hp_s.numpy()[0, :idx_map["n_obs"]]
+            qp_pred = qp_s.numpy()[0, :idx_map["n_wells"]]
+            qin_pred = qip_s.numpy()[0, 0]
+
+            future_h.append(hp_pred * (h_max[:idx_map["n_obs"]] - h_min[:idx_map["n_obs"]]) + h_min[:idx_map["n_obs"]])
+            future_qin.append(qin_pred * 500.0)
+
+            if step < teacher_forcing_steps:
+                next_step_scaled = scaler.transform(future_feedback_df.iloc[step:step + 1])[0]
+                new_step = next_step_scaled.reshape(1, 1, -1)
+            else:
+                new_step = curr_win[:, -1:, :].copy()
+                new_step[0, 0, :idx_map["n_obs"]] = hp_pred
+                
+                if step < len(future_feedback_df):
+                    next_step_scaled_real = scaler.transform(future_feedback_df.iloc[step:step + 1])[0]
+                    new_step[0, 0, idx_map["n_obs"]:idx_map["h_end"]] = next_step_scaled_real[idx_map["n_obs"]:idx_map["h_end"]]
+                    if idx_map["flow_start"] < new_step.shape[-1]:
+                        new_step[0, 0, idx_map["flow_start"]:] = next_step_scaled_real[idx_map["flow_start"]:]
+                else:
+                    new_step[0, 0, idx_map["n_obs"]:idx_map["h_end"]] = curr_win[0, -1, idx_map["n_obs"]:idx_map["h_end"]]
+                    if idx_map["flow_start"] < new_step.shape[-1]:
+                        new_step[0, 0, idx_map["flow_start"]:] = curr_win[0, -1, idx_map["flow_start"]:]
+                        new_step[0, 0, idx_map["flow_start"]:idx_map["flow_start"] + idx_map["n_wells"]] = qp_pred
+
+            curr_win = np.append(curr_win[:, 1:, :], new_step, axis=1)
+        future_h, future_qin = np.array(future_h), np.array(future_qin)
+        np.save(f"{save_p}/background_h_7d.npy", future_h)
+        np.save(f"{save_p}/qin_7d_dynamic.npy", future_qin)
+
+        # --- 新增：反向基準推導專用 --- 產生含現場真實抽水的極度準確預測水位
+        print("\n🎯 [混合重疊原理] 正在產生含電力特徵的神準預測水位（Reverse Superposition Baseline）...")
+        # 擷取包含 Context Window + 欲預測區間 的真實資料
+        delta_hours = config["window_size"] * config["DELTA_T"]
+        actual_predict_data = df_master.loc[(df_master.index >= (predict_start - pd.Timedelta(hours=delta_hours))) & (df_master.index < predict_end)]
+        if len(actual_predict_data) > config["window_size"]:
+            X_acc, _ = create_seq(actual_predict_data)
+            # 確保輸出的長度剛好等於 predict_steps
+            X_acc = X_acc[:predict_steps]
+            hp_acc_s, _, _ = model.predict(X_acc, verbose=0)
+            accurate_h = hp_acc_s[:, :idx_map["n_obs"]] * (h_max[:idx_map["n_obs"]] - h_min[:idx_map["n_obs"]]) + h_min[:idx_map["n_obs"]]
+            np.save(f"{save_p}/accurate_pred_h_7d.npy", accurate_h)
+            print(f"  📥 已儲存：accurate_pred_h_7d.npy (用於最佳化反向推導)")
+        else:
+            print(f"  ⚠️ 無法產生 accurate_pred_h_7d.npy，真實資料量不足以支撐 {predict_steps} 步预测。")
+        # ----------------------------------------------------
+
+        # --- 預測 vs 實際比對 ---
+        actual_test_df = df_master.loc[(df_master.index > predict_start) & (df_master.index <= predict_end)][obs_cols]
+        if len(actual_test_df) > predict_steps:
+            actual_test_df = actual_test_df.iloc[:predict_steps]
+        actual_h_test = actual_test_df.values if len(actual_test_df) > 0 else None
+        future_h_bc = None
+        accurate_h_bc = None
+
+        if actual_h_test is not None and len(actual_h_test) > 0:
+            n_compare = min(len(future_h), len(actual_h_test))
+            print(f"\n📊 [背景水位(抽水=0)] vs 實際對比（共 {n_compare} 步 = {n_compare * config['DELTA_T']:.0f} 小時）：")
+            print(f"{'觀測井':<12} | {'MAE (m)':<10} | {'RMSE (m)':<10}")
+            print("-" * 40)
+            for i, col in enumerate(obs_cols):
+                mae_val = mean_absolute_error(actual_h_test[:n_compare, i], future_h[:n_compare, i])
+                rmse_val = np.sqrt(np.mean((actual_h_test[:n_compare, i] - future_h[:n_compare, i])**2))
+                print(f"{col:<12} | {mae_val:<10.4f} | {rmse_val:<10.4f}")
+            overall_mae = mean_absolute_error(actual_h_test[:n_compare].flatten(), future_h[:n_compare].flatten())
+            print(f"{'整體':<12} | {overall_mae:<10.4f}")
         
-        new_step = curr_win[:, -1:, :].copy()
-        new_step[0, 0, :idx_map["n_obs"]] = hp_s.numpy()[0, :idx_map["n_obs"]]
-        new_step[0, 0, idx_map["h_end"]:] = 0
-        curr_win = np.append(curr_win[:, 1:, :], new_step, axis=1)
-    future_h, future_qin = np.array(future_h), np.array(future_qin)
-    np.save(f"{save_p}/background_h_7d.npy", future_h)
-    np.save(f"{save_p}/qin_7d_dynamic.npy", future_qin)
+            # 額外印出神準水位的比對
+            if 'accurate_h' in locals() and len(accurate_h) >= n_compare:
+                print(f"\n🎯 [神準預測水位(含真實抽水)] vs 實際對比：")
+                acc_overall_mae = mean_absolute_error(actual_h_test[:n_compare].flatten(), accurate_h[:n_compare].flatten())
+                print(f"{'整體 MAE':<12} | {acc_overall_mae:<10.4f}  <-- 最佳化將以這條線為基準進行反向推導！")
 
-    # --- 新增：反向基準推導專用 --- 產生含現場真實抽水的極度準確預測水位
-    print("\n🎯 [混合重疊原理] 正在產生含電力特徵的神準預測水位（Reverse Superposition Baseline）...")
-    # 擷取包含 Context Window + 欲預測區間 的真實資料
-    delta_hours = config["window_size"] * config["DELTA_T"]
-    actual_predict_data = df_master.loc[(df_master.index >= (predict_start - pd.Timedelta(hours=delta_hours))) & (df_master.index < predict_end)]
-    if len(actual_predict_data) > config["window_size"]:
-        X_acc, _ = create_seq(actual_predict_data)
-        # 確保輸出的長度剛好等於 predict_steps
-        X_acc = X_acc[:predict_steps]
-        hp_acc_s, _, _ = model.predict(X_acc, verbose=0)
-        accurate_h = hp_acc_s[:, :idx_map["n_obs"]] * (h_max[:idx_map["n_obs"]] - h_min[:idx_map["n_obs"]]) + h_min[:idx_map["n_obs"]]
-        np.save(f"{save_p}/accurate_pred_h_7d.npy", accurate_h)
-        print(f"  📥 已儲存：accurate_pred_h_7d.npy (用於最佳化反向推導)")
-    else:
-        print(f"  ⚠️ 無法產生 accurate_pred_h_7d.npy，真實資料量不足以支撐 {predict_steps} 步预测。")
-    # ----------------------------------------------------
+            bias_steps = min(max(1, teacher_forcing_steps), n_compare)
+            future_bias = np.mean(actual_h_test[:bias_steps] - future_h[:bias_steps], axis=0)
+            future_h_bc = future_h + future_bias
+            future_bc_mae = mean_absolute_error(actual_h_test[:n_compare].flatten(), future_h_bc[:n_compare].flatten())
+            print(f"\n🧭 Future_h bias correction：使用前 {bias_steps} 步估計偏移")
+            print(f"{'校正前 MAE':<12} | {overall_mae:<10.4f}")
+            print(f"{'校正後 MAE':<12} | {future_bc_mae:<10.4f}")
+            np.save(f"{save_p}/background_h_7d_bias_corrected.npy", future_h_bc)
 
-    # --- 預測 vs 實際比對 ---
-    actual_test_df = df_master.loc[predict_start:predict_end][obs_cols]
-    if len(actual_test_df) > predict_steps:
-        actual_test_df = actual_test_df.iloc[:predict_steps]
-    actual_h_test = actual_test_df.values if len(actual_test_df) > 0 else None
+            if 'accurate_h' in locals() and len(accurate_h) > 0:
+                n_acc_compare = min(len(accurate_h), len(actual_h_test))
+                acc_bias_steps = min(max(1, teacher_forcing_steps), n_acc_compare)
+                accurate_bias = np.mean(actual_h_test[:acc_bias_steps] - accurate_h[:acc_bias_steps], axis=0)
+                accurate_h_bc = accurate_h + accurate_bias
+                accurate_bc_mae = mean_absolute_error(actual_h_test[:n_acc_compare].flatten(), accurate_h_bc[:n_acc_compare].flatten())
+                print(f"\n🧭 Accurate_h bias correction：使用前 {acc_bias_steps} 步估計偏移")
+                print(f"{'校正前 MAE':<12} | {acc_overall_mae:<10.4f}")
+                print(f"{'校正後 MAE':<12} | {accurate_bc_mae:<10.4f}")
+                np.save(f"{save_p}/accurate_pred_h_7d_bias_corrected.npy", accurate_h_bc)
+        else:
+            actual_h_test = None
+            print("⚠️ 預測區間內無實際資料可比對")
 
-    if actual_h_test is not None and len(actual_h_test) > 0:
-        n_compare = min(len(future_h), len(actual_h_test))
-        print(f"\n📊 [背景水位(抽水=0)] vs 實際對比（共 {n_compare} 步 = {n_compare * config['DELTA_T']:.0f} 小時）：")
-        print(f"{'觀測井':<12} | {'MAE (m)':<10} | {'RMSE (m)':<10}")
-        print("-" * 40)
+        # ==========================================
+        # 🌟 5. [完整報告生成] 包含消失的 MAE 與 MAPE
+        # ==========================================
+        print("\n📊 正在生成 Full_Diagnostic_Report.csv (水位 & 流量誤差全記錄)...")
+        diag_data = []
+        T_res, C_res = tf.exp(model.T_log).numpy(), tf.exp(model.C_log).numpy()
+        point_names = obs_cols + wells_list
+
+        for i, name in enumerate(point_names):
+            # A. 水位誤差 (所有點都有)
+            h_mae = mean_absolute_error(ht_train[:, i], hp_train[:, i])
+            h_mape = calculate_wape(ht_train[:, i], hp_train[:, i])
+        
+            # B. 初始化流量誤差與效率
+            q_mae, q_mape, eff = np.nan, np.nan, 100.0
+        
+            # C. 抽水井專屬誤差計算
+            if name in wells_list:
+                w_idx = wells_list.index(name)
+                # 流量誤差 (Actual qt vs Predicted qp)
+                q_mae = mean_absolute_error(qt_train[:, w_idx], qp_train[:, w_idx])
+                q_mape = calculate_wape(qt_train[:, w_idx], qp_train[:, w_idx])
+            
+                # 淤塞效率計算
+                avg_q = np.mean(qp_train[:, w_idx])
+                s_f = (avg_q / (2 * 3.14159 * T_res[i] + 1e-4)) * np.log(100.0 / 0.45)
+                s_w = C_res[w_idx] * (avg_q ** 2)
+                eff = (s_f / (s_f + s_w + 1e-6)) * 100
+
+            diag_data.append({
+                "Well": name, 
+                "Type": "Pump" if name in wells_list else "Obs", 
+                "MAE_Level(m)": h_mae, 
+                "MAPE_Level(%)": h_mape,
+                "MAE_Flow(m3/hr)": q_mae,
+                "MAPE_Flow(%)": q_mape,
+                "Efficiency(%)": eff
+            })
+
+        df_diag = pd.DataFrame(diag_data)
+        df_diag.to_csv(f"{save_p}/Full_Diagnostic_Report.csv", index=False, encoding='utf-8-sig')
+        print(df_diag.to_string(index=False, na_rep='-'))
+
+        # ==========================================
+        # 🌟 6. 繪圖邏輯 (包含 Y 軸格式化修正)
+        # ==========================================
+        print("📈 繪製所有診斷圖表...")
+    
+        # 1. 水位擬合 (1_Water_Level.png)
+        rows_h = int(np.ceil(idx_map['n_obs']/3)); fig1, ax1 = plt.subplots(rows_h, 3, figsize=(18, 4*rows_h)); ax1 = ax1.flatten()
+        for i in range(idx_map['n_obs']): ax1[i].plot(ht_train[:, i], alpha=0.5, label='Actual'); ax1[i].plot(hp_train[:, i], linestyle='--', label='PINN'); ax1[i].set_title(obs_cols[i]); ax1[i].legend()
+        fig1.tight_layout(); fig1.savefig(f"{save_p}/1_Water_Level.png"); plt.close()
+
+        # 2. 流量擬合 (2_Flow_Rate.png) 與 效率 (3_Efficiency_Chart.png)
+        if idx_map['n_wells'] > 0:
+            rows_q = int(np.ceil(idx_map['n_wells']/3)); fig2, ax2 = plt.subplots(rows_q, 3, figsize=(18, 4*rows_q)); ax2 = ax2.flatten()
+            for i in range(idx_map['n_wells']): ax2[i].plot(qt_train[:, i], color='green', label='Act'); ax2[i].plot(qp_train[:, i], color='red', linestyle='--', label='Pred'); ax2[i].set_title(f"Flow: {wells_list[i]}"); ax2[i].legend()
+            fig2.tight_layout(); fig2.savefig(f"{save_p}/2_Flow_Rate.png"); plt.close()
+            plt.figure(figsize=(10, 6)); df_p = df_diag[df_diag['Type']=="Pump"]; plt.bar(df_p['Well'], df_p['Efficiency(%)']); plt.axhline(y=70, color='red', linestyle='--'); plt.title("Efficiency (%)"); plt.savefig(f"{save_p}/3_Efficiency_Chart.png"); plt.close()
+
+        # 3. Loss 曲線 (4, 5, 6 號圖)
+        for l_key, l_name, l_file in [('l_dat','Data Loss','4_Data_Loss.png'),('l_phy','Phys Loss','5_Phys_Loss.png'),('loss','Total Loss','6_Total_Loss.png')]:
+            plt.figure(figsize=(8, 5))
+            ax = plt.gca()
+            plt.plot(history.history[l_key], color='black' if l_key=='loss' else None, linewidth=2)
+        
+            # 保持對數縮放
+            plt.yscale('log')
+        
+            # 🌟 核心修正：強制顯示數值標籤
+            from matplotlib.ticker import ScalarFormatter
+            y_formatter = ScalarFormatter(useOffset=False)
+            y_formatter.set_scientific(False) # 禁用 1e2 這種科學記號
+            ax.yaxis.set_major_formatter(y_formatter)
+        
+            # 設置小數點後一位
+            ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
+        
+            # 自動增加刻度密度，防止範圍太小時沒刻度
+            ax.yaxis.set_major_locator(ticker.LogLocator(base=10.0, subs='all', numticks=10))
+        
+            plt.title(l_name)
+            plt.grid(True, which="both", alpha=0.3)
+            plt.xlabel("Epochs")
+            plt.ylabel("Loss Value")
+            plt.savefig(f"{save_p}/{l_file}")
+            plt.close()
+
+        # 4. 物理直線圖 (8_PINN_Physics_Line.png)
+        # 重新準備 X_reg, Y_reg 以繪製散佈圖 (Area*dH/dt vs Q_pump)
+        try:
+            X_reg_plot = (config["area_A"] * dH_dt_pinn[valid_idx])
+            Y_reg_plot = total_Q_train[valid_idx]
+            plt.figure(figsize=(10, 6)); plt.scatter(X_reg_plot, Y_reg_plot, alpha=0.3, color='gray', label='Cleaned Data (Actual)')
+            x_r = np.array([np.min(X_reg_plot), np.max(X_reg_plot)])
+            plt.plot(x_r, inflow_pinn_mean - (learned_sy * x_r), color='red', linewidth=3, label=f'PINN Physics Line (Sy={learned_sy:.3f}, R2={r2_pinn_val:.3f})')
+            plt.xlabel("Area * dH/dt (m3/hr)"); plt.ylabel("Total Pumping Q (m3/hr)"); plt.title("Physical Mass Balance"); plt.legend(); plt.grid(True, alpha=0.3); plt.savefig(f"{save_p}/8_PINN_Physics_Line.png"); plt.close()
+        except Exception as e:
+            print(f"⚠️ 物理直線圖繪製失敗: {e}")
+
+        # 5. Qin 時間序列 (9_Qin_TimeSeries.png)
+        plt.figure(figsize=(12, 5)); plt.plot(qin_series, color='steelblue', alpha=0.4, label='Qin(t) Train'); plt.plot(qin_smooth, color='darkorange', linewidth=2, label='Smoothed'); 
+        plt.plot(np.arange(len(future_qin)) + len(qin_series), future_qin, color='red', linewidth=2, linestyle='--', label='7D Dynamic Pred')
+        plt.axhline(inflow_pinn_mean, color='gray', linestyle=':', label=f'Mean Qin={inflow_pinn_mean:.1f}'); plt.title("Derived & Predicted Dynamic Inflow TimeSeries"); plt.legend(); plt.grid(True, alpha=0.3); plt.savefig(f"{save_p}/9_Qin_TimeSeries.png"); plt.close()
+
+        # 6. 預測 vs 實際 對比圖 (Prediction_vs_Actual.png)
+        n_obs_plot = len(obs_cols)
+        rows_test = int(np.ceil(n_obs_plot / 3))
+        fig_test, axes_test = plt.subplots(rows_test, 3, figsize=(18, 4 * rows_test))
+        axes_test = axes_test.flatten()
+        time_hours = np.arange(len(future_h)) * config["DELTA_T"]
+        # 計算全域 Y 軸範圍，確保所有小圖比例一致
+        all_vals = []
+        all_vals.append(future_h)
+        has_accurate_h = 'accurate_h' in locals() and len(accurate_h) > 0
+        if has_accurate_h:
+            all_vals.append(accurate_h)
+        if actual_h_test is not None: all_vals.append(actual_h_test)
+        y_min_total = np.min([np.min(v) for v in all_vals]) - 0.5
+        y_max_total = np.max([np.max(v) for v in all_vals]) + 0.5
+
         for i, col in enumerate(obs_cols):
-            mae_val = mean_absolute_error(actual_h_test[:n_compare, i], future_h[:n_compare, i])
-            rmse_val = np.sqrt(np.mean((actual_h_test[:n_compare, i] - future_h[:n_compare, i])**2))
-            print(f"{col:<12} | {mae_val:<10.4f} | {rmse_val:<10.4f}")
-        overall_mae = mean_absolute_error(actual_h_test[:n_compare].flatten(), future_h[:n_compare].flatten())
-        print(f"{'整體':<12} | {overall_mae:<10.4f}")
-        
-        # 額外印出神準水位的比對
-        if 'accurate_h' in locals() and len(accurate_h) >= n_compare:
-            print(f"\n🎯 [神準預測水位(含真實抽水)] vs 實際對比：")
-            acc_overall_mae = mean_absolute_error(actual_h_test[:n_compare].flatten(), accurate_h[:n_compare].flatten())
-            print(f"{'整體 MAE':<12} | {acc_overall_mae:<10.4f}  <-- 最佳化將以這條線為基準進行反向推導！")
-    else:
-        actual_h_test = None
-        print("⚠️ 預測區間內無實際資料可比對")
-
-    # ==========================================
-    # 🌟 5. [完整報告生成] 包含消失的 MAE 與 MAPE
-    # ==========================================
-    print("\n📊 正在生成 Full_Diagnostic_Report.csv (水位 & 流量誤差全記錄)...")
-    diag_data = []
-    T_res, C_res = tf.exp(model.T_log).numpy(), tf.exp(model.C_log).numpy()
-    point_names = obs_cols + wells_list
-
-    for i, name in enumerate(point_names):
-        # A. 水位誤差 (所有點都有)
-        h_mae = mean_absolute_error(ht_train[:, i], hp_train[:, i])
-        h_mape = calculate_wape(ht_train[:, i], hp_train[:, i])
-        
-        # B. 初始化流量誤差與效率
-        q_mae, q_mape, eff = np.nan, np.nan, 100.0
-        
-        # C. 抽水井專屬誤差計算
-        if name in wells_list:
-            w_idx = wells_list.index(name)
-            # 流量誤差 (Actual qt vs Predicted qp)
-            q_mae = mean_absolute_error(qt_train[:, w_idx], qp_train[:, w_idx])
-            q_mape = calculate_wape(qt_train[:, w_idx], qp_train[:, w_idx])
-            
-            # 淤塞效率計算
-            avg_q = np.mean(qp_train[:, w_idx])
-            s_f = (avg_q / (2 * 3.14159 * T_res[i] + 1e-4)) * np.log(100.0 / 0.45)
-            s_w = C_res[w_idx] * (avg_q ** 2)
-            eff = (s_f / (s_f + s_w + 1e-6)) * 100
-
-        diag_data.append({
-            "Well": name, 
-            "Type": "Pump" if name in wells_list else "Obs", 
-            "MAE_Level(m)": h_mae, 
-            "MAPE_Level(%)": h_mape,
-            "MAE_Flow(m3/hr)": q_mae,
-            "MAPE_Flow(%)": q_mape,
-            "Efficiency(%)": eff
-        })
-
-    df_diag = pd.DataFrame(diag_data)
-    df_diag.to_csv(f"{save_p}/Full_Diagnostic_Report.csv", index=False, encoding='utf-8-sig')
-    print(df_diag.to_string(index=False, na_rep='-'))
-
-    # ==========================================
-    # 🌟 6. 繪圖邏輯 (包含 Y 軸格式化修正)
-    # ==========================================
-    print("📈 繪製所有診斷圖表...")
-    
-    # 1. 水位擬合 (1_Water_Level.png)
-    rows_h = int(np.ceil(idx_map['n_obs']/3)); fig1, ax1 = plt.subplots(rows_h, 3, figsize=(18, 4*rows_h)); ax1 = ax1.flatten()
-    for i in range(idx_map['n_obs']): ax1[i].plot(ht_train[:, i], alpha=0.5, label='Actual'); ax1[i].plot(hp_train[:, i], linestyle='--', label='PINN'); ax1[i].set_title(obs_cols[i]); ax1[i].legend()
-    fig1.tight_layout(); fig1.savefig(f"{save_p}/1_Water_Level.png"); plt.close()
-
-    # 2. 流量擬合 (2_Flow_Rate.png) 與 效率 (3_Efficiency_Chart.png)
-    if idx_map['n_wells'] > 0:
-        rows_q = int(np.ceil(idx_map['n_wells']/3)); fig2, ax2 = plt.subplots(rows_q, 3, figsize=(18, 4*rows_q)); ax2 = ax2.flatten()
-        for i in range(idx_map['n_wells']): ax2[i].plot(qt_train[:, i], color='green', label='Act'); ax2[i].plot(qp_train[:, i], color='red', linestyle='--', label='Pred'); ax2[i].set_title(f"Flow: {wells_list[i]}"); ax2[i].legend()
-        fig2.tight_layout(); fig2.savefig(f"{save_p}/2_Flow_Rate.png"); plt.close()
-        plt.figure(figsize=(10, 6)); df_p = df_diag[df_diag['Type']=="Pump"]; plt.bar(df_p['Well'], df_p['Efficiency(%)']); plt.axhline(y=70, color='red', linestyle='--'); plt.title("Efficiency (%)"); plt.savefig(f"{save_p}/3_Efficiency_Chart.png"); plt.close()
-
-    # 3. Loss 曲線 (4, 5, 6 號圖)
-    for l_key, l_name, l_file in [('l_dat','Data Loss','4_Data_Loss.png'),('l_phy','Phys Loss','5_Phys_Loss.png'),('loss','Total Loss','6_Total_Loss.png')]:
-        plt.figure(figsize=(8, 5))
-        ax = plt.gca()
-        plt.plot(history.history[l_key], color='black' if l_key=='loss' else None, linewidth=2)
-        
-        # 保持對數縮放
-        plt.yscale('log')
-        
-        # 🌟 核心修正：強制顯示數值標籤
-        from matplotlib.ticker import ScalarFormatter
-        y_formatter = ScalarFormatter(useOffset=False)
-        y_formatter.set_scientific(False) # 禁用 1e2 這種科學記號
-        ax.yaxis.set_major_formatter(y_formatter)
-        
-        # 設置小數點後一位
-        ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.1f'))
-        
-        # 自動增加刻度密度，防止範圍太小時沒刻度
-        ax.yaxis.set_major_locator(ticker.LogLocator(base=10.0, subs='all', numticks=10))
-        
-        plt.title(l_name)
-        plt.grid(True, which="both", alpha=0.3)
-        plt.xlabel("Epochs")
-        plt.ylabel("Loss Value")
-        plt.savefig(f"{save_p}/{l_file}")
+            axes_test[i].plot(
+                time_hours[:len(future_h)],
+                future_h[:, i],
+                color='forestgreen',
+                linewidth=2,
+                label='Future_h (Rolling)'
+            )
+            if has_accurate_h:
+                axes_test[i].plot(
+                    time_hours[:len(accurate_h)],
+                    accurate_h[:, i],
+                    color='darkorange',
+                    linewidth=2,
+                    label='Accurate_h (Teacher)'
+                )
+            if actual_h_test is not None:
+                n_future = min(len(future_h), len(actual_h_test))
+                axes_test[i].plot(time_hours[:n_future], actual_h_test[:n_future, i], color='steelblue', alpha=0.7, label='Actual')
+                mae_future = mean_absolute_error(actual_h_test[:n_future, i], future_h[:n_future, i])
+                if has_accurate_h:
+                    n_acc = min(len(accurate_h), len(actual_h_test))
+                    mae_acc = mean_absolute_error(actual_h_test[:n_acc, i], accurate_h[:n_acc, i])
+                    axes_test[i].set_title(f"{col} (F={mae_future:.3f}m, A={mae_acc:.3f}m)")
+                else:
+                    axes_test[i].set_title(f"{col} (F={mae_future:.3f}m)")
+            else:
+                axes_test[i].set_title(col)
+            axes_test[i].set_xlabel("Hours")
+            axes_test[i].set_ylabel("Level (m)")
+            axes_test[i].set_ylim(y_min_total, y_max_total) # 固定 Y 軸比例
+            axes_test[i].legend()
+            axes_test[i].grid(True, alpha=0.3)
+        for j in range(n_obs_plot, len(axes_test)):
+            fig_test.delaxes(axes_test[j])
+        fig_test.suptitle(f"Prediction vs Actual: {config['PREDICT_START']} ~ {config['PREDICT_END']}", fontsize=14)
+        fig_test.tight_layout()
+        fig_test.savefig(f"{save_p}/Prediction_vs_Actual.png", bbox_inches='tight')
         plt.close()
 
-    # 4. 物理直線圖 (8_PINN_Physics_Line.png)
-    # 重新準備 X_reg, Y_reg 以繪製散佈圖 (Area*dH/dt vs Q_pump)
-    try:
-        X_reg_plot = (config["area_A"] * dH_dt_pinn[valid_idx])
-        Y_reg_plot = total_Q_train[valid_idx]
-        plt.figure(figsize=(10, 6)); plt.scatter(X_reg_plot, Y_reg_plot, alpha=0.3, color='gray', label='Cleaned Data (Actual)')
-        x_r = np.array([np.min(X_reg_plot), np.max(X_reg_plot)])
-        plt.plot(x_r, inflow_pinn_mean - (learned_sy * x_r), color='red', linewidth=3, label=f'PINN Physics Line (Sy={learned_sy:.3f}, R2={r2_pinn_val:.3f})')
-        plt.xlabel("Area * dH/dt (m3/hr)"); plt.ylabel("Total Pumping Q (m3/hr)"); plt.title("Physical Mass Balance"); plt.legend(); plt.grid(True, alpha=0.3); plt.savefig(f"{save_p}/8_PINN_Physics_Line.png"); plt.close()
-    except Exception as e:
-        print(f"⚠️ 物理直線圖繪製失敗: {e}")
+        if actual_h_test is not None and future_h_bc is not None:
+            fig_test_bc, axes_test_bc = plt.subplots(rows_test, 3, figsize=(18, 4 * rows_test))
+            axes_test_bc = axes_test_bc.flatten()
+            all_vals_bc = [future_h_bc, actual_h_test]
+            y_min_bc = np.min([np.min(v) for v in all_vals_bc]) - 0.5
+            y_max_bc = np.max([np.max(v) for v in all_vals_bc]) + 0.5
 
-    # 5. Qin 時間序列 (9_Qin_TimeSeries.png)
-    plt.figure(figsize=(12, 5)); plt.plot(qin_series, color='steelblue', alpha=0.4, label='Qin(t) Train'); plt.plot(qin_smooth, color='darkorange', linewidth=2, label='Smoothed'); 
-    plt.plot(np.arange(len(future_qin)) + len(qin_series), future_qin, color='red', linewidth=2, linestyle='--', label='7D Dynamic Pred')
-    plt.axhline(inflow_pinn_mean, color='gray', linestyle=':', label=f'Mean Qin={inflow_pinn_mean:.1f}'); plt.title("Derived & Predicted Dynamic Inflow TimeSeries"); plt.legend(); plt.grid(True, alpha=0.3); plt.savefig(f"{save_p}/9_Qin_TimeSeries.png"); plt.close()
+            for i, col in enumerate(obs_cols):
+                axes_test_bc[i].plot(
+                    time_hours[:len(future_h_bc)],
+                    future_h_bc[:, i],
+                    color='forestgreen',
+                    linewidth=2,
+                    label='Future_h BC'
+                )
+                n_future_bc = min(len(future_h_bc), len(actual_h_test))
+                axes_test_bc[i].plot(time_hours[:n_future_bc], actual_h_test[:n_future_bc, i], color='steelblue', alpha=0.7, label='Actual')
+                mae_future_bc = mean_absolute_error(actual_h_test[:n_future_bc, i], future_h_bc[:n_future_bc, i])
+                axes_test_bc[i].set_title(f"{col} (Fbc={mae_future_bc:.3f}m)")
+                axes_test_bc[i].set_xlabel("Hours")
+                axes_test_bc[i].set_ylabel("Level (m)")
+                axes_test_bc[i].set_ylim(y_min_bc, y_max_bc)
+                axes_test_bc[i].legend()
+                axes_test_bc[i].grid(True, alpha=0.3)
 
-    # 6. 預測 vs 實際 對比圖 (Prediction_vs_Actual.png)
-    n_obs_plot = len(obs_cols)
-    rows_test = int(np.ceil(n_obs_plot / 3))
-    fig_test, axes_test = plt.subplots(rows_test, 3, figsize=(18, 4 * rows_test))
-    axes_test = axes_test.flatten()
-    time_hours = np.arange(len(future_h)) * config["DELTA_T"]
-    # 計算全域 Y 軸範圍，確保所有小圖比例一致
-    all_vals = []
-    if 'accurate_h' in locals() and len(accurate_h) > 0: all_vals.append(accurate_h)
-    else: all_vals.append(future_h)
-    if actual_h_test is not None: all_vals.append(actual_h_test)
-    y_min_total = np.min([np.min(v) for v in all_vals]) - 0.5
-    y_max_total = np.max([np.max(v) for v in all_vals]) + 0.5
+            for j in range(n_obs_plot, len(axes_test_bc)):
+                fig_test_bc.delaxes(axes_test_bc[j])
+            fig_test_bc.suptitle(f"Prediction vs Actual (Bias Corrected): {config['PREDICT_START']} ~ {config['PREDICT_END']}", fontsize=14)
+            fig_test_bc.tight_layout()
+            fig_test_bc.savefig(f"{save_p}/Prediction_vs_Actual_BiasCorrected.png", bbox_inches='tight')
+            plt.close(fig_test_bc)
 
-    for i, col in enumerate(obs_cols):
-        # 繪製神準預測水位（包含實際抽水特徵）
-        if 'accurate_h' in locals() and len(accurate_h) > 0:
-             pred_to_plot = accurate_h
-             label_name = 'Predicted (w/ Actual Pumps)'
-        else:
-             pred_to_plot = future_h
-             label_name = 'Predicted (Pure Background)'
-             
-        axes_test[i].plot(time_hours[:len(pred_to_plot)], pred_to_plot[:, i], color='darkorange', linewidth=2, label=label_name)
-        if actual_h_test is not None:
-            n_c = min(len(pred_to_plot), len(actual_h_test))
-            axes_test[i].plot(time_hours[:n_c], actual_h_test[:n_c, i], color='steelblue', alpha=0.7, label='Actual')
-            mae_i = mean_absolute_error(actual_h_test[:n_c, i], pred_to_plot[:n_c, i])
-            axes_test[i].set_title(f"{col} (MAE={mae_i:.3f}m)")
-        else:
-            axes_test[i].set_title(col)
-        axes_test[i].set_xlabel("Hours")
-        axes_test[i].set_ylabel("Level (m)")
-        axes_test[i].set_ylim(y_min_total, y_max_total) # 固定 Y 軸比例
-        axes_test[i].legend()
-        axes_test[i].grid(True, alpha=0.3)
-    for j in range(n_obs_plot, len(axes_test)):
-        fig_test.delaxes(axes_test[j])
-    fig_test.suptitle(f"Prediction vs Actual: {config['PREDICT_START']} ~ {config['PREDICT_END']}", fontsize=14)
-    fig_test.tight_layout()
-    fig_test.savefig(f"{save_p}/Prediction_vs_Actual.png", bbox_inches='tight')
-    plt.close()
-
-    # 7. 背景水位回升趨勢圖 (background_h_7d_trend.png)
-    print("📈 正在繪製 7 天背景水位回升趨勢圖...")
-    plt.figure(figsize=(12, 6))
-    time_h = np.arange(len(future_h)) * config["DELTA_T"]
-    colors = plt.cm.get_cmap('tab20')(np.linspace(0, 1, len(obs_cols)))
-    for i, col in enumerate(obs_cols):
-        plt.plot(time_h, future_h[:, i], color=colors[i], label=col, alpha=0.8)
+        # 7. 背景水位回升趨勢圖 (background_h_7d_trend.png)
+        print("📈 正在繪製 7 天背景水位回升趨勢圖...")
+        plt.figure(figsize=(12, 6))
+        time_h = np.arange(len(future_h)) * config["DELTA_T"]
+        colors = plt.cm.get_cmap('tab20')(np.linspace(0, 1, len(obs_cols)))
+        for i, col in enumerate(obs_cols):
+            plt.plot(time_h, future_h[:, i], color=colors[i], label=col, alpha=0.8)
     
-    plt.axhline(y=-11.0, color='red', linestyle='--', linewidth=2, label='Static SWL (-11m)')
-    plt.title(f"7-Day Background Water Level Recovery (Predicted by AI)\n{config['PREDICT_START']} ~ {config['PREDICT_END']}")
-    plt.xlabel("Hours (Autoregressive Steps)")
-    plt.ylabel("Water Level (m)")
-    plt.legend(loc='upper left', bbox_to_anchor=(1, 1), ncol=1, fontsize=9)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(f"{save_p}/background_h_7d_trend.png", bbox_inches='tight')
-    plt.close()
+        plt.axhline(y=-11.0, color='red', linestyle='--', linewidth=2, label='Static SWL (-11m)')
+        plt.title(f"7-Day Background Water Level Recovery (Predicted by AI)\n{config['PREDICT_START']} ~ {config['PREDICT_END']}")
+        plt.xlabel("Hours (Autoregressive Steps)")
+        plt.ylabel("Water Level (m)")
+        plt.legend(loc='upper left', bbox_to_anchor=(1, 1), ncol=1, fontsize=9)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f"{save_p}/background_h_7d_trend.png", bbox_inches='tight')
+        plt.close()
 
-    print(f"✅ 任務完成！報告與圖表已儲存於 {save_p}")
-
-    print(f"✅ 任務完成！報告與圖表已儲存於 {save_p}")
+        print(f"✅ 任務完成！報告與圖表已儲存於 {save_p}")

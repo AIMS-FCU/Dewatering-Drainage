@@ -17,8 +17,8 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 # 1. 系統核心配置
 # ==========================================
 opt_config = {
-    "ANALYSIS_START": "2021-5-14 00:00",
-    "ANALYSIS_END":   "2021-5-21 00:00",
+    "ANALYSIS_START": "2020-10-24 00:00",
+    "ANALYSIS_END":   "2020-10-31 00:00",
     "AREA": 3319.95,
     # "SY": 0.161,
     "DEPTH": 19.55,
@@ -36,8 +36,9 @@ opt_config = {
     "SIM_HOURS": 168,    
     "SIM_STEPS": 168,    
     "MIN_ACTIVE_WELLS": 0,
+    "INITIAL_CARRYOVER_HOURS": 6,
     "BUFFER_HOURS": 12,
-    "pinn_report_path": "PINN_MAPE_Complete_Report3/5",
+    "pinn_report_path": "PINN_MAPE_Complete_Report3/12_bias",
     "WELL_LIST": ["PW01", "PW02", "PW03", "PW04", "PW06", "PW07", "PW08", "PW09", "PW010", "PW011", "PW012", "PW013"],
     "OBS_LIST": ['PA', 'PB', 'PC', 'FPS7', 'FPS8', 'FPS9', 'FPS2', 'FPS3', 'FPS4', 'FPS5', 'FPS6'],
 
@@ -138,7 +139,9 @@ class DynamicCalibrator:
 # ==========================================
 # 3. 核心最佳化引擎 (PuLP)
 # ==========================================
-def run_pulp_optimization(pinn_params, well_powers, base_h_sim, dist_matrix, target_h_array):
+def run_pulp_optimization(pinn_params, well_powers, base_h_sim, dist_matrix, target_h_array,
+                          initial_status=None, remaining_on_steps=None,
+                          initial_active_count=0, carryover_count_steps=0):
     T = pinn_params['T'] * opt_config["CALIBRATION"]["T_ADJUST_FACTOR"]
     C = pinn_params['C']
     num_wells, num_obs = len(well_powers), base_h_sim.shape[1]
@@ -149,6 +152,16 @@ def run_pulp_optimization(pinn_params, well_powers, base_h_sim, dist_matrix, tar
 
     x = LpVariable.dicts("X", (times, wells), cat='Binary')
     slack = LpVariable.dicts("S", (times, obs), lowBound=0, cat='Continuous')
+
+    if initial_status is None:
+        initial_status = np.zeros(num_wells, dtype=int)
+    else:
+        initial_status = np.asarray(initial_status, dtype=int)
+
+    if remaining_on_steps is None:
+        remaining_on_steps = np.zeros(num_wells, dtype=int)
+    else:
+        remaining_on_steps = np.asarray(remaining_on_steps, dtype=int)
 
     total_energy_expr = lpSum([x[t][i] * well_powers[i] * opt_config["delta_t"] for t in times for i in wells])
     # 將懲罰係數從一億改成一萬，避免超大係數造成矩陣數值不穩定 (Ill-conditioned) 讓求解器卡死
@@ -174,6 +187,14 @@ def run_pulp_optimization(pinn_params, well_powers, base_h_sim, dist_matrix, tar
 
     # 限制式：最小連續運轉時間 = 6小時
     # 方案一：優化邏輯，摒棄 y 變數，改用總和式表達 (大幅減少分支維度)
+    for i in wells:
+        prob += x[0][i] == int(initial_status[i])
+        for t in range(1, min(sim_steps, int(remaining_on_steps[i]) + 1)):
+            prob += x[t][i] == 1
+
+    for t in range(min(sim_steps, int(carryover_count_steps))):
+        prob += lpSum([x[t][i] for i in wells]) >= int(initial_active_count)
+
     min_on_steps = int(6 / opt_config["delta_t"])
     for i in wells:
         for t in range(min_on_steps, sim_steps):
@@ -197,6 +218,69 @@ def run_pulp_optimization(pinn_params, well_powers, base_h_sim, dist_matrix, tar
         "avg_active_wells": np.mean(np.sum(schedule, axis=1)),
         "active_wells_series": np.sum(schedule, axis=1)
     }
+
+
+def build_well_comparison_table(time_index, well_list, actual_schedule, optimized_schedule):
+    comparison_rows = []
+
+    for t in range(len(time_index)):
+        actual_on = [well_list[i] for i, flag in enumerate(actual_schedule[t]) if flag > 0.5]
+        optimized_on = [well_list[i] for i, flag in enumerate(optimized_schedule[t]) if flag > 0.5]
+
+        actual_set = set(actual_on)
+        optimized_set = set(optimized_on)
+        matched = sorted(actual_set & optimized_set)
+        actual_only = sorted(actual_set - optimized_set)
+        optimized_only = sorted(optimized_set - actual_set)
+
+        comparison_rows.append({
+            "時間": time_index[t],
+            "實際開井數": len(actual_on),
+            "最佳化開井數": len(optimized_on),
+            "實際開井井號": ", ".join(actual_on) if actual_on else "-",
+            "最佳化開井井號": ", ".join(optimized_on) if optimized_on else "-",
+            "共同開井井號": ", ".join(matched) if matched else "-",
+            "實際有開但模型沒開": ", ".join(actual_only) if actual_only else "-",
+            "模型有開但實際沒開": ", ".join(optimized_only) if optimized_only else "-",
+            "井號完全一致": int(actual_set == optimized_set)
+        })
+
+    return pd.DataFrame(comparison_rows)
+
+
+def compute_carryover_constraints(df_raw, eval_start, well_list, sim_steps):
+    min_on_steps = int(6 / opt_config["delta_t"])
+    history_hours = max(min_on_steps - 1, 0)
+    history_start = eval_start - pd.Timedelta(hours=history_hours)
+    df_history = df_raw.loc[history_start:eval_start].iloc[::2].copy()
+
+    initial_status = np.zeros(len(well_list), dtype=int)
+    remaining_on_steps = np.zeros(len(well_list), dtype=int)
+
+    for idx, w in enumerate(well_list):
+        qw_col = f"Qw{int(''.join(filter(str.isdigit, w))):02d}"
+        if qw_col not in df_history.columns or df_history.empty:
+            continue
+
+        history_series = (df_history[qw_col].values > 0.5).astype(int)
+        if len(history_series) == 0:
+            continue
+
+        initial_status[idx] = int(history_series[-1])
+        if initial_status[idx] == 0:
+            continue
+
+        consecutive_on = 0
+        for flag in history_series[::-1]:
+            if flag == 1:
+                consecutive_on += 1
+            else:
+                break
+
+        remaining_on_steps[idx] = max(0, min_on_steps - consecutive_on)
+
+    carryover_steps = min(sim_steps, int(np.max(remaining_on_steps)) + 1 if np.any(initial_status) else 1)
+    return initial_status, remaining_on_steps, df_history.index, carryover_steps
 
 
 # ==========================================
@@ -224,6 +308,25 @@ if __name__ == "__main__":
     if len(actual_active_series) < opt_config["SIM_STEPS"]:
         actual_active_series = np.pad(actual_active_series, (0, opt_config["SIM_STEPS"] - len(actual_active_series)), 'edge')
     actual_active_series = actual_active_series[:opt_config["SIM_STEPS"]]
+
+    actual_schedule_full = np.zeros((opt_config["SIM_STEPS"], len(well_list)))
+    for idx, w in enumerate(well_list):
+        qw_col = f"Qw{int(''.join(filter(str.isdigit, w))):02d}"
+        if qw_col in df_actual.columns:
+            series = (df_actual[qw_col].values > 0.5).astype(int)
+            if len(series) < opt_config["SIM_STEPS"]:
+                series = np.pad(series, (0, opt_config["SIM_STEPS"] - len(series)), 'edge')
+            actual_schedule_full[:, idx] = series[:opt_config["SIM_STEPS"]]
+
+    initial_status, remaining_on_steps, _, _ = compute_carryover_constraints(
+        df_raw, eval_start, well_list, opt_config["SIM_STEPS"]
+    )
+    active_carryover_wells = [well_list[i] for i, flag in enumerate(initial_status) if flag == 1]
+    initial_active_count = int(initial_status.sum())
+    carryover_count_steps = min(
+        opt_config["SIM_STEPS"],
+        int(opt_config["INITIAL_CARRYOVER_HOURS"] / opt_config["delta_t"])
+    )
 
     # --- B. 載入 PINN 參數 & 起始水位 ---
     try:
@@ -348,7 +451,41 @@ if __name__ == "__main__":
     target_h_array = np.full(len(obs_list), float(opt_config["FIXED_TARGET_H"]))
     print(f"   - 所有觀測井目標皆設定為: ≤ {opt_config['FIXED_TARGET_H']} m")
 
-    res = run_pulp_optimization({'T': learned_T, 'C': learned_C}, well_specific_powers, bg_h_preds, dist_matrix_np, target_h_array)
+    print(f"   - 承接現場當下開井: {', '.join(active_carryover_wells) if active_carryover_wells else '-'}")
+    if active_carryover_wells:
+        carryover_desc = ", ".join([
+            f"{well_list[i]} 還需維持 {remaining_on_steps[i]} 步"
+            for i, flag in enumerate(initial_status) if flag == 1
+        ])
+        print(f"   - 最短續開限制: {carryover_desc}")
+
+    res = run_pulp_optimization(
+        {'T': learned_T, 'C': learned_C},
+        well_specific_powers,
+        bg_h_preds,
+        dist_matrix_np,
+        target_h_array,
+        initial_status=initial_status,
+        remaining_on_steps=remaining_on_steps,
+        initial_active_count=initial_active_count,
+        carryover_count_steps=carryover_count_steps
+    )
+
+    compare_time_index = df_actual.index[:opt_config["SIM_STEPS"]]
+    optimized_schedule_binary = (res['schedule'] > 0.5).astype(int)
+    df_well_compare = build_well_comparison_table(
+        compare_time_index,
+        well_list,
+        actual_schedule_full.astype(int),
+        optimized_schedule_binary
+    )
+    well_compare_path = os.path.join(pinn_path, "Well_Open_Comparison.csv")
+    df_well_compare.to_csv(well_compare_path, index=False, encoding="utf-8-sig")
+
+    exact_match_rate = df_well_compare["井號完全一致"].mean() * 100
+    total_actual_opens = int(actual_schedule_full.sum())
+    total_optimized_opens = int(optimized_schedule_binary.sum())
+    total_matched_opens = int(np.logical_and(actual_schedule_full > 0.5, optimized_schedule_binary > 0.5).sum())
 
     # --- G. 誤差分析 ---
     pred_h_all = np.zeros_like(bg_h_preds)
@@ -378,6 +515,14 @@ if __name__ == "__main__":
     print("\n" + "█"*75)
     print(f" ⚡ 智慧降水：電力與物理對標綜合驗證報告")
     print(f" ---------------------------------------------------------------------------")
+    print(f"\n ?? 開井井號比對摘要：")
+    print(f"  實際開井總次數: {total_actual_opens}")
+    print(f"  最佳化開井總次數: {total_optimized_opens}")
+    print(f"  共同開井總次數: {total_matched_opens}")
+    print(f"  每時段井號完全一致率: {exact_match_rate:.1f}%")
+    print(f"  井號比對明細已輸出: {well_compare_path}")
+    print(f"\n ?? 前 10 筆開井井號比對：")
+    print(df_well_compare.head(10).to_string(index=False))
     print(f" 🏆 節能表現: {saving_pct:+.2f} % | 🚀 流量偏差: {vol_diff_pct:+.2f} %")
     print(f" ---------------------------------------------------------------------------")
     print(f" 項目              |   現場實際 (Actual)  |   最佳化 (Model)")
