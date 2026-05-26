@@ -1,148 +1,197 @@
-# PINN 二期遷移學習與微調手冊
+# PINN 二期 Transfer Learning 微調手冊
 
-對應程式：`PINN正式_Phase2_Training_Transfer_二期微調.py`
+本手冊對應程式：
 
-## 1. 程式用途
+```text
+github/PINN二期內容/PINN正式_Phase2_Training_Transfer_二期微調.py
+```
 
-此程式用於二期資料訓練，並可載入一期 PINN 權重進行 transfer learning。主要目的：
+此程式會讀取二期資料，並嘗試載入一期 PINN 權重作為初始化，再針對二期井位、二期觀測井與二期時間區間進行微調。
 
-- 使用二期資料微調一期模型。
-- 比較不同訓練資料範圍對 7 天預測的影響。
-- 輸出二期最佳化需要的 PINN 參數與背景水位。
+## 執行前準備
 
-## 2. 必要輸入檔
+請確認同一資料夾內至少有：
 
-| 檔案 | 用途 |
-|---|---|
-| `Phase2_Training_Data2.csv` | 二期訓練資料 |
-| `Distance_Matrix_Phase2.csv` | 二期距離矩陣 |
-| `PINN_MAPE_Complete_Report3_Run1_56/pinn_model.weights.h5` | 一期權重，供遷移學習使用 |
+```text
+Phase2_Training_Data2.csv
+Distance_Matrix_Phase2.csv
+PINN正式_Phase2_Training_Transfer_二期微調.py
+```
 
-若找不到 `Phase2_Training_Data2.csv`，程式會嘗試改用 `Phase2_Training_Data.csv`。
+另需確認一期權重存在。程式預設：
 
-## 3. 二期資料欄位邏輯
+```python
+"phase1_weights_path": "PINN_MAPE_Complete_Report3_Run1_56/pinn_model.weights.h5"
+```
 
-觀測井候選：
+若一期結果資料夾不在二期資料夾內，請改成正確路徑，例如：
+
+```python
+"phase1_weights_path": "../PINN一期內容/PINN_MAPE_Complete_Report3_Run1_56/pinn_model.weights.h5"
+```
+
+## 執行方式
+
+```powershell
+cd github\PINN二期內容
+python PINN正式_Phase2_Training_Transfer_二期微調.py
+```
+
+二期程式預設使用 mixed precision，GPU 記憶體通常比一期省，但若仍 OOM，將 `batch_size` 從 `256` 改成 `128` 或 `64`。
+
+## 二期資料與井位
+
+二期觀測井預設：
 
 ```text
 PW02, PW03, PW04
 ```
 
-抽水井候選：
+二期抽水井預設：
 
 ```text
 PW01, PW010, PW011, PW05, PW06, PW07, PW08, PW09
 ```
 
-流量欄位會依抽水井名稱自動尋找 `Qw**` 或 `QW**`。
+請注意 `PW010`、`PW011` 是三碼井號。資料欄位、距離矩陣、最佳化設定必須都使用同一種命名。
 
-## 4. 模型架構
+## 重要設定
 
-沿用一期雙模型架構：
+設定集中在程式前段 `config`。
 
-```text
-FlowPredictor
-WaterLevelPredictor
-PINN_Feedback_Model
-```
+| 參數 | 預設值 | 說明 |
+|---|---:|---|
+| `window_size` | 336 | 7 天歷史 context，30 分鐘資料下為 336 筆 |
+| `epochs` | 300 | 微調總輪數 |
+| `batch_size` | 256 | 每批樣本數 |
+| `nn_lr_init` | 0.0001 | 微調學習率，低於一期避免破壞既有權重 |
+| `warmup_epochs` | 150 | 物理 loss 暖身 |
+| `HEAD_WARMUP_EPOCHS` | 30 | 前 30 epoch 先訓練輸出頭，降低 transfer shock |
+| `EARLY_STOPPING_PATIENCE` | 40 | loss 長期未改善時停止 |
+| `START_LEVEL_CORRECTION` | True | 用預測起點實測水位校正 7 天背景水位 |
+| `training_data_path` | `Phase2_Training_Data2.csv` | 二期訓練資料 |
+| `allow_partial_transfer` | True | 允許部分權重載入，適合一期與二期欄位數不同 |
+| `phase1_weights_path` | 一期權重路徑 | 執行前最常需要修改 |
 
-二期新增/強化重點：
+## 預設任務
 
-- 可載入一期權重。
-- 可局部載入不完全匹配的權重。
-- 載入權重後會重置物理參數 `T/R/C/Sy`，避免一期地質參數直接套到二期。
-- 有 `HEAD_WARMUP_EPOCHS`，先訓練輸出頭，再解凍全模型。
-- 有 `START_LEVEL_CORRECTION`，可做起始水位錨定。
+程式中的 `tasks` 預設啟用兩個 Full 微調任務：
 
-## 5. 重要超參數
+| 任務 | 輸出資料夾 | 預測區間 | 盲測區間 |
+|---|---|---|---|
+| Early | `微調/Report_Full_0301_Early` | 2026-03-01 到 2026-03-08 | 2026-02-01 到 2026-02-15 |
+| Late | `微調/Report_Full_0324_Late` | 2026-03-24 到 2026-03-31 | 2026-03-01 到 2026-03-15 |
 
-| 參數 | 目前設定 | 意義 | 調整建議 |
-|---|---:|---|---|
-| `window_size` | 336 | 輸入歷史 7 天半小時資料 | 通常不動 |
-| `epochs` | 300 | 總訓練輪數 | 微調不收斂可增加 |
-| `batch_size` | 256 | 每批樣本數 | OOM 改 128 或 64 |
-| `nn_lr_init` | 0.0001 | 遷移學習微調學習率 | 二期不穩時降低 |
-| `HEAD_WARMUP_EPOCHS` | 30 | 先只訓練輸出頭 | 資料少建議 20-50 |
-| `EARLY_STOPPING_PATIENCE` | 40 | loss 無改善後停止 | 想更久訓練可增加 |
-| `warmup_epochs` | 150 | 物理 loss 暖身 | physics 太早干擾時增加 |
-| `lambda_flow` | 150.0 | 流量 loss 權重 | 流量預測差時調整 |
-| `lambda_phys_final` | 2.0 | 物理 loss 權重 | 水位趨勢不物理時調整 |
-| `START_LEVEL_CORRECTION` | True | 起始水位錨定 | 報告需同時看 raw/corrected |
-| `START_LEVEL_CORRECTION_MAX_ABS` | None | 校正最大幅度 | 想限制最大修正可設 2.0 |
+程式內也保留 1Month、3Month 的 task 範例，但目前是註解狀態。若要啟用，移除對應區塊的註解即可。
 
-## 6. `HEAD_WARMUP_EPOCHS` 是什麼
+## Transfer Learning 流程
 
-`HEAD_WARMUP_EPOCHS=30` 代表前 30 epoch 只訓練輸出層與 bias，凍結 Transformer backbone。目的：
+二期微調大致流程：
 
-```text
-先讓模型輸出層適應二期水位/流量尺度，
-避免一開始就把一期學到的時序特徵全部改亂。
-```
+1. 讀取 `Phase2_Training_Data2.csv`。
+2. 讀取 `Distance_Matrix_Phase2.csv`。
+3. 建立二期欄位對應與 scaler。
+4. 建立與二期欄位數相符的 PINN 模型。
+5. 嘗試載入 `phase1_weights_path`。
+6. 若一期與二期模型部分層不相容，依 `allow_partial_transfer=True` 跳過不相容權重。
+7. 先執行 head warmup，再進入完整微調。
+8. 產生盲測報告、7 天自回歸背景水位與診斷圖。
 
-之後程式會解凍全模型，進入完整微調。
+## 起始水位校正
 
-## 7. `START_LEVEL_CORRECTION` 邏輯
+`START_LEVEL_CORRECTION=True` 時，程式會用 `PREDICT_START` 當下的實測水位，校正 7 天自回歸預測的起始偏移。
 
-此功能只使用 `PREDICT_START` 當下已知水位，不使用未來 7 天答案。
-
-```text
-校正量 = 起始時刻實測水位 - 模型第一步預測水位
-校正後水位 = 原始 7 天預測水位 + 校正量
-```
-
-可解釋為：
+輸出會多出：
 
 ```text
-將預測起點錨定到現場已知初始水位，後續 7 天走勢仍由模型自回歸決定。
+background_h_7d_raw.npy
+background_h_7d.npy
+start_level_bias_correction.csv
 ```
 
-報告時建議同時提供：
+含義：
 
-- `background_h_7d_raw.npy`：未校正預測。
-- `background_h_7d.npy`：校正後預測。
-- `start_level_bias_correction.csv`：每口井校正量。
+- `background_h_7d_raw.npy`：校正前的背景水位。
+- `background_h_7d.npy`：校正後的背景水位，最佳化主要使用這份。
+- `start_level_bias_correction.csv`：每口觀測井套用的偏移量。
 
-若 `Applied_Bias` 超過 2 m，代表模型絕對水位基準偏移明顯，需特別註明。
+若 `Applied_Bias` 過大，代表模型在預測起點已有明顯偏移，建議回頭檢查資料期間、scaler、二期欄位與一期權重是否合適。
 
-## 8. 微調任務設計
+## 主要輸出
 
-程式內目前主要有 Full 任務，1Month / 3Month 任務可取消註解使用。
+每個 task 會輸出到 `save_folder`：
 
-| 類型 | 訓練資料概念 | 用途 |
+| 檔案 | 說明 | 後續用途 |
 |---|---|---|
-| Full | 使用指定 cutoff 前可用資料 | 看完整歷史資料效果 |
-| 1Month | 只用 2026-01-01 到 2026-02-01 | 看少量資料微調效果 |
-| 3Month | 用 2026-01-01 到預測日前夕 | 看近期資料是否改善預測 |
+| `pinn_model.weights.h5` | 二期微調後模型權重 | 後續二期再微調或推論 |
+| `inference_pack.pkl` | scaler、欄位順序、config | 重現與推論 |
+| `learned_T.npy` | 二期學得的 T | 最佳化 |
+| `learned_C.npy` | 二期井損係數 | 最佳化 |
+| `calibrated_inflow_sy.npy` | 二期 Qin 與 Sy | 最佳化 |
+| `background_h_7d.npy` | 7 天無抽水背景水位 | 二期最佳化關鍵輸入 |
+| `future_q_7d.npy` | 7 天流量預測 | 診斷 |
+| `qin_7d_dynamic.npy` | 7 天動態補注量 | 最佳化與診斷 |
+| `accurate_pred_h_7d.npy` | 使用實際抽水條件的水位預測 | 最佳化反向推導 |
+| `Full_Diagnostic_Report_Test.csv` | 盲測評估 | 模型品質判斷 |
+| `Full_Diagnostic_Report.csv` | 預測區間診斷 | 報告 |
+| `Prediction_vs_Actual_Obs.png` | 觀測井水位預測圖 | 首要檢查 |
+| `Prediction_vs_Actual_PW.png` | 抽水井水位預測圖 | 輔助檢查 |
+| `Prediction_vs_Actual_Flow.png` | 流量預測圖 | 輔助檢查 |
+| `background_h_7d_trend.png` | 背景水位趨勢 | 最佳化前檢查 |
 
-注意：推論時仍會使用 `PREDICT_START` 前 7 天作為 context window，這是實務上可取得的現場歷史狀態。
+## 結果判讀
 
-## 9. 執行方式
+建議先看：
+
+1. `Prediction_vs_Actual_Obs.png`：二期觀測井 `PW02/PW03/PW04` 趨勢是否合理。
+2. `Full_Diagnostic_Report_Test.csv`：盲測 MAE 是否可接受。
+3. `start_level_bias_correction.csv`：校正偏移是否過大。
+4. `background_h_7d_trend.png`：背景水位是否平滑且符合現場直覺。
+
+若 Raw MAE 很大但 Corrected MAE 明顯改善，代表模型趨勢可用，但起點偏移需要校正。若兩者都很差，通常是資料欄位、訓練區間或 transfer 權重不合適。
+
+## 最常修改的位置
+
+| 需求 | 修改位置 |
+|---|---|
+| 換一期權重 | `phase1_weights_path` |
+| 換二期資料檔 | `training_data_path` |
+| 只跑一個任務 | 註解掉 `tasks` 內不需要的 dict |
+| 改預測日期 | task 內 `PREDICT_START`、`PREDICT_END` |
+| 改盲測日期 | task 內 `TEST_START`、`TEST_END` |
+| 啟用 1Month 或 3Month 微調 | 取消註解對應 task |
+| GPU 記憶體不足 | 降 `batch_size` |
+| 校正偏移限制過大 | 設定 `START_LEVEL_CORRECTION_MAX_ABS`，例如 `2.0` |
+
+## 新資料進來時
+
+若二期新資料只是增加時間長度，井位與井名沒有變，通常流程是：
 
 ```powershell
+python data_preprocess_phase2.py
 python PINN正式_Phase2_Training_Transfer_二期微調.py
 ```
 
-## 10. 主要輸出檔
+若新資料包含新增井、刪除井、井名改變或新的實測座標，請先更新：
 
-| 檔案 | 用途 |
-|---|---|
-| `pinn_model.weights.h5` | 二期微調後權重 |
-| `inference_pack.pkl` | 二期推論資訊 |
-| `learned_T.npy` | 二期學得 T |
-| `learned_C.npy` | 二期井損係數 |
-| `calibrated_inflow_sy.npy` | Qin 與 Sy |
-| `background_h_7d_raw.npy` | 起始校正前水位預測 |
-| `background_h_7d.npy` | 起始校正後水位預測 |
-| `start_level_bias_correction.csv` | 起始水位校正量 |
-| `accurate_pred_h_7d.npy` | 含真實序列基準水位 |
-| `Prediction_vs_Actual_Obs.png` | 觀測井水位對比 |
-| `Prediction_vs_Actual_PW.png` | 抽水井水位對比 |
-| `Prediction_vs_Actual_Flow.png` | 流量對比 |
+```text
+generate_mock_distance_matrix.py
+```
 
-## 11. 判讀規則
+主要修改：
 
-- Raw MAE 好：模型本身絕對水位基準準。
-- Raw MAE 差、Corrected MAE 好：趨勢有學到，但基準偏移。
-- Corrected MAE 仍差：模型未學到該 7 天動態，需檢查抽水型態、資料區間、流量欄位。
-- 三個月不一定一定比一個月好；若三個月資料包含不同抽水型態，可能讓模型基準漂移。
+- `pumping_wells`：二期抽水井。
+- `obs_wells`：二期觀測井。
+- `coords`：每口井座標。
 
+執行後會重新產生：
+
+```text
+Distance_Matrix_Phase2.csv
+```
+
+更完整的新資料處理、欄位命名與距離矩陣更新步驟，請看：
+
+```text
+00_二期新資料與距離矩陣更新說明.md
+```
